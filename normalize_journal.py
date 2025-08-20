@@ -286,7 +286,7 @@ def _norm_key(s: str) -> str:
     s = re.sub(r"\s+", "", s)   # remove ALL spaces
     return s
 
-def build_yearly_outputs(input_folder="db_raw", output_dir="out", log_file="log.csv", sheet_name=0):
+def build_yearly_outputs(input_folder="journal_raw", output_dir="out/journal", log_file="log.csv", sheet_name=0):
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     buckets = {}  # year -> list[df]
 
@@ -350,4 +350,4 @@ def build_yearly_outputs(input_folder="db_raw", output_dir="out", log_file="log.
 
 if __name__ == "__main__":
     # Adjust paths if needed
-    build_yearly_outputs(input_folder="db_raw", output_dir="out", sheet_name=0)
+    build_yearly_outputs(input_folder="journal_raw", output_dir="out/journal", sheet_name=0)
