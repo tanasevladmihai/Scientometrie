@@ -30,6 +30,7 @@ import argparse
 import os
 import pandas as pd
 import re
+import glob
 
 
 # ---------- Utilities ----------
@@ -73,14 +74,117 @@ def normalize_value(v: str) -> str:
     v = re.sub(r"\s+", " ", v).strip()
     return v
 
-def merge_possible(df_row, candidates):
+
+def normalize_title(v: str) -> str:
+    if pd.isna(v): return ""
+    v = str(v).lower().replace("&", "and")
+    v = re.sub(r"[^a-z0-9]+", " ", v)
+    return re.sub(r"\s+", " ", v).strip()
+
+def build_journal_index(journal_dir: str):
+    frames = []
+    for path in glob.glob(os.path.join(journal_dir, "normalized_*.xlsx")):
+        year = int(re.search(r"(\d{4})", os.path.basename(path)).group(1))
+        df = pd.read_excel(path, dtype=str)
+        df.columns = [c.strip().lower() for c in df.columns]
+
+        if "journal_title" not in df.columns:
+            continue
+
+        sub = pd.DataFrame({
+            "norm_title": df["journal_title"].map(normalize_title),
+            "year": year,
+            "if": df["score_if"] if "score_if" in df.columns else "",
+            "ais": df["score_ais"] if "score_ais" in df.columns else "",
+        })
+        frames.append(sub)
+    return pd.concat(frames, ignore_index=True)
+
+
+def build_core_index(core_dir: str):
+    frames = []
+    for path in glob.glob(os.path.join(core_dir, "core_normalized_*.csv")):
+        year = int(re.search(r"(\d{4})", os.path.basename(path)).group(1))
+        df = pd.read_csv(path, dtype=str)
+        df.columns = [c.strip().lower() for c in df.columns]
+
+        if "name" not in df.columns or "rank" not in df.columns:
+            continue
+
+        sub = pd.DataFrame({
+            "norm_title": df["name"].map(normalize_title),
+            "year": year,
+            "core_rank": df["rank"],
+        })
+        frames.append(sub)
+    return pd.concat(frames, ignore_index=True)
+
+def lookup_scores(title_raw, year, jidx, cidx):
+    """Lookup IF/AIS/CORE rank for possibly multiple forum names separated by '/'."""
+    if not title_raw:
+        return "", "", ""
+
+    parts = [t.strip() for t in title_raw.split("/") if t.strip()]
+    if not parts:
+        return "", "", ""
+
+    scores_if, scores_ais, scores_core = [], [], []
+    for part in parts:
+        norm = normalize_title(part)
+        # journal match
+        jmatch = jidx[(jidx["norm_title"] == norm) & (jidx["year"] == year)]
+        if not jmatch.empty:
+            scores_if.append(to_text(jmatch["if"].iloc[0]))
+            scores_ais.append(to_text(jmatch["ais"].iloc[0]))
+        # core match
+        cmatch = cidx[(cidx["norm_title"] == norm) & (cidx["year"] == year)]
+        if not cmatch.empty:
+            scores_core.append(to_text(cmatch["core_rank"].iloc[0]))
+
+    return " / ".join([s for s in scores_if if s]), \
+           " / ".join([s for s in scores_ais if s]), \
+           " / ".join([s for s in scores_core if s])
+
+
+def attach_scores(formatted_df, journal_dir="out/journal", core_dir="out/core"):
+    jidx = build_journal_index(journal_dir)
+    cidx = build_core_index(core_dir)
+
+    formatted_df = formatted_df.copy()
+    formatted_df["year"] = pd.to_numeric(formatted_df["An"], errors="coerce")
+
+    results = formatted_df.apply(
+        lambda r: lookup_scores(r["FORUM (Revista, Conferința)"], r["year"], jidx, cidx),
+        axis=1, result_type="expand"
+    )
+    results.columns = ["Categorie IF", "Categorie AIS", "CORE Rank"]
+
+    df = pd.concat([formatted_df, results], axis=1)
+
+    # remove duplicates
+    df = df.drop_duplicates(
+        subset=["Titlu", "Autori", "FORUM (Revista, Conferința)", "An"],
+        keep="first"
+    ).reset_index(drop=True)
+
+    # drop helper cols if you don’t want them
+    if "norm_title" in df.columns:
+        df = df.drop(columns=["norm_title"])
+    return df
+
+
+
+def merge_possible(df_row, candidates, clean_authors=False):
     """Return merged values from all matching columns, joined with / if different."""
     vals = []
     seen = set()
     for c in candidates:
-        if c in df_row.index:
+        if c in df_row.index and "id" not in c.lower():   # skip IDs
             v = to_text(df_row[c])
             if v:
+                if clean_authors:
+                    # remove anything in parentheses
+                    v = re.sub(r"\s*\([^)]*\)", "", v).strip()
                 norm = normalize_value(v)
                 if norm not in seen:
                     seen.add(norm)
@@ -170,7 +274,10 @@ def format_final(df: pd.DataFrame) -> pd.DataFrame:
     out["Nr.crt."] = range(1, len(df) + 1)
 
     out["Titlu"] = df.apply(lambda r: merge_possible(r, ["Title", "TI", "Article Title"]), axis=1)
-    out["Autori"] = df.apply(lambda r: merge_possible(r, ["Authors", "Author full names", "AF", "AU"]), axis=1)
+    out["Autori"] = df.apply(
+        lambda r: merge_possible(r, ["Author Full Names", "Author full names", "AF", "AU"], clean_authors=True),
+        axis=1
+    )
 
     out["FORUM (Revista, Conferința)"] = df.apply(
         lambda r: " / ".join(
@@ -191,9 +298,6 @@ def format_final(df: pd.DataFrame) -> pd.DataFrame:
         ),
         axis=1
     )
-
-    out["Categorie IF"] = "empty"
-    out["Categorie AIS"] = "empty"
     return out
 
 
@@ -222,6 +326,7 @@ def main():
             wos_df = pd.read_excel(wos_path, dtype=str)
             merged_raw = combine(scopus_df, wos_df)
             formatted = format_final(merged_raw)
+            formatted = attach_scores(formatted, journal_dir="out/journal", core_dir="out/core")
             out_path = os.path.join(args.output, f"{base}_merged.xlsx")
             formatted.to_excel(out_path, index=False)
             print(f"Merged {scopus_path} + {wos_path} -> {out_path}")
