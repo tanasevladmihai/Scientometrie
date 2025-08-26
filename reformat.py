@@ -268,6 +268,57 @@ def combine(scopus_df, wos_df):
 
     return pd.DataFrame(merged_rows)
 
+def read_any_table(path: str) -> pd.DataFrame:
+    """
+    Robust reader for Scopus/WoS exports.
+
+    - .csv/.tsv/.txt: try common separators & encodings
+    - .xls/.xlsx: try Excel engines; if that fails, try tab-delimited text (many WoS .xls are TSV)
+    """
+    ext = os.path.splitext(path)[1].lower()
+
+    # Text-like formats
+    if ext in {".csv", ".tsv", ".txt"}:
+        # Try straightforward CSV
+        try:
+            df = pd.read_csv(path, dtype=str)
+            if df.shape[1] > 1:
+                return df
+        except Exception:
+            pass
+        # Try alternative seps/encodings
+        for sep in [",", "\t", ";", "|"]:
+            for enc in ["utf-8", "utf-8-sig", "latin1", "utf-16", "utf-16le"]:
+                try:
+                    df = pd.read_csv(path, sep=sep, encoding=enc, dtype=str)
+                    if df.shape[1] > 1:
+                        return df
+                except Exception:
+                    continue
+        raise RuntimeError(f"Unable to parse text file: {path}")
+
+    # Excel formats
+    if ext in {".xls", ".xlsx"}:
+        # Try native Excel readers
+        for engine in [None, "openpyxl", "xlrd"]:
+            try:
+                df = pd.read_excel(path, engine=engine, dtype=str)
+                if df.shape[1] > 1:
+                    return df
+            except Exception:
+                continue
+        # Fallback: mislabeled WoS .xls as TSV
+        for enc in ["utf-16", "utf-16le", "utf-8-sig", "latin1", "utf-8"]:
+            try:
+                df = pd.read_csv(path, sep="\t", encoding=enc, dtype=str)
+                if df.shape[1] > 1:
+                    return df
+            except Exception:
+                continue
+        raise RuntimeError(f"Unable to read Excel file: {path}. Try installing 'openpyxl' and 'xlrd'.")
+
+    # Last resort: let pandas guess
+    return pd.read_csv(path, dtype=str)
 
 def format_final(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)
@@ -311,6 +362,7 @@ def main():
 
     os.makedirs(args.output, exist_ok=True)
 
+    # group files by basename
     files = os.listdir(args.input)
     basenames = {}
     for f in files:
@@ -322,14 +374,27 @@ def main():
         wos_path = next((p for p in paths if p.lower().endswith((".xls", ".xlsx"))), None)
 
         if scopus_path and wos_path:
+            # both exports available → combine, then format
             scopus_df = pd.read_csv(scopus_path, dtype=str)
             wos_df = pd.read_excel(wos_path, dtype=str)
-            merged_raw = combine(scopus_df, wos_df)
-            formatted = format_final(merged_raw)
-            formatted = attach_scores(formatted, journal_dir="out/journal", core_dir="out/core")
-            out_path = os.path.join(args.output, f"{base}_merged.xlsx")
-            formatted.to_excel(out_path, index=False)
-            print(f"Merged {scopus_path} + {wos_path} -> {out_path}")
+            raw = combine(scopus_df, wos_df)
+            suffix = "_merged"
+        elif scopus_path or wos_path:
+            # only one export available → just use it as-is, then format
+            only_path = scopus_path or wos_path
+            raw = read_any_table(only_path)
+            suffix = "_single"
+        else:
+            # nothing usable in this group
+            continue
+
+        # format + attach scores (IF/AIS/CORE) as usual
+        formatted = format_final(raw)
+        formatted = attach_scores(formatted, journal_dir="out/journal", core_dir="out/core")
+
+        out_path = os.path.join(args.output, f"{base}{suffix}.xlsx")
+        formatted.to_excel(out_path, index=False)
+        print(f"Saved -> {out_path}")
 
 
 if __name__ == "__main__":
