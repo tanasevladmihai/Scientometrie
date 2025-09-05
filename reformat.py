@@ -81,16 +81,109 @@ def normalize_title(v: str) -> str:
     v = re.sub(r"[^a-z0-9]+", " ", v)
     return re.sub(r"\s+", " ", v).strip()
 
+# ---------- helpers for picking "best" scores ----------
+
+def _best_quartile(vals):
+    """
+    Choose best among quartile-like labels (Q1..Q4, 'N/A', empty).
+    Highest priority: Q1 > Q2 > Q3 > Q4 > anything else.
+    """
+    order = {"q1": 4, "q2": 3, "q3": 2, "q4": 1}
+    best = None
+    best_rank = -1
+    for v in vals:
+        if not v:
+            continue
+        k = str(v).strip().lower()
+        rank = order.get(k, 0)
+        if rank > best_rank:
+            best_rank = rank
+            best = v
+    return best or ""
+
+def _best_numeric(vals):
+    """
+    Choose largest numeric value from a list of strings; ignore non-numerics.
+    """
+    best_val = None
+    best_raw = ""
+    for v in vals:
+        try:
+            x = float(str(v).replace(",", "."))
+        except Exception:
+            continue
+        if best_val is None or x > best_val:
+            best_val = x
+            best_raw = v
+    return best_raw or ""
+
+def _best_if_or_quartile(vals):
+    """
+    IF may be provided as quartile (Q1..Q4) or numeric. Prefer:
+      - best quartile if any quartiles exist
+      - otherwise, the largest numeric
+    """
+    vals = [to_text(v) for v in vals if to_text(v)]
+    if not vals:
+        return ""
+    any_quart = any(str(v).strip().upper().startswith("Q") for v in vals)
+    return _best_quartile(vals) if any_quart else _best_numeric(vals)
+
+# ---------- year-fallback lookup (use latest <= paper year; if none, use latest available) ----------
+
+def _lookup_journal_best(jidx, norm, year):
+    """
+    Use ONLY the exact year if it exists for (norm, year).
+    If not, fall back to the latest year strictly < given year.
+    If still none, return empty.
+    """
+    sub = jidx[jidx["norm_title"] == norm]
+    if sub.empty or pd.isna(year):
+        return "", ""
+    y = int(year)
+
+    exact = sub[sub["year"] == y]
+    if not exact.empty:
+        chosen = exact.iloc[0]  # already aggregated to "best" per (title, year)
+        return to_text(chosen.get("if", "")), to_text(chosen.get("ais", ""))
+
+    # fallback: latest prior year only
+    prior = sub[sub["year"] < y]
+    if prior.empty:
+        return "", ""
+    chosen = prior.sort_values("year", ascending=False).iloc[0]
+    return to_text(chosen.get("if", "")), to_text(chosen.get("ais", ""))
+
+
+def _lookup_core_best(cidx, norm, year):
+    """
+    Use ONLY the exact year if available; otherwise fall back to latest prior year.
+    """
+    sub = cidx[cidx["norm_title"] == norm]
+    if sub.empty or pd.isna(year):
+        return ""
+    y = int(year)
+
+    exact = sub[sub["year"] == y]
+    if not exact.empty:
+        return to_text(exact.iloc[0].get("core_rank", ""))
+
+    prior = sub[sub["year"] < y]
+    if prior.empty:
+        return ""
+    return to_text(prior.sort_values("year", ascending=False).iloc[0].get("core_rank", ""))
+
+
+# ---------- build indexes (aggregate duplicates per (title, year)) ----------
+
 def build_journal_index(journal_dir: str):
     frames = []
     for path in glob.glob(os.path.join(journal_dir, "normalized_*.xlsx")):
         year = int(re.search(r"(\d{4})", os.path.basename(path)).group(1))
         df = pd.read_excel(path, dtype=str)
         df.columns = [c.strip().lower() for c in df.columns]
-
         if "journal_title" not in df.columns:
             continue
-
         sub = pd.DataFrame({
             "norm_title": df["journal_title"].map(normalize_title),
             "year": year,
@@ -98,7 +191,23 @@ def build_journal_index(journal_dir: str):
             "ais": df["score_ais"] if "score_ais" in df.columns else "",
         })
         frames.append(sub)
-    return pd.concat(frames, ignore_index=True)
+
+    jidx = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["norm_title","year","if","ais"])
+
+    # collapse duplicates per (norm_title, year) keeping BEST scores
+    def agg_best(g):
+        return pd.Series({
+            "if": _best_if_or_quartile(g["if"].tolist()),
+            "ais": _best_quartile(g["ais"].tolist())
+        })
+
+    if not jidx.empty:
+        jidx = jidx.groupby(["norm_title", "year"], as_index=False).apply(
+            agg_best, include_groups=False
+        )
+        # ensure year is int
+        jidx["year"] = jidx["year"].astype(int)
+    return jidx
 
 
 def build_core_index(core_dir: str):
@@ -107,43 +216,54 @@ def build_core_index(core_dir: str):
         year = int(re.search(r"(\d{4})", os.path.basename(path)).group(1))
         df = pd.read_csv(path, dtype=str)
         df.columns = [c.strip().lower() for c in df.columns]
-
         if "name" not in df.columns or "rank" not in df.columns:
             continue
-
         sub = pd.DataFrame({
             "norm_title": df["name"].map(normalize_title),
             "year": year,
             "core_rank": df["rank"],
         })
         frames.append(sub)
-    return pd.concat(frames, ignore_index=True)
+
+    cidx = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["norm_title","year","core_rank"])
+    if not cidx.empty:
+        # if multiple ranks exist for same (title, year), keep the best (A* > A > B > C > else)
+        order = {"a*": 4, "a": 3, "b": 2, "c": 1}
+        def best_core(g):
+            best = ""
+            best_rank = -1
+            for v in g["core_rank"].tolist():
+                k = str(v).strip().lower()
+                r = order.get(k, 0)
+                if r > best_rank:
+                    best_rank, best = r, v
+            return pd.Series({"core_rank": best})
+
+        cidx = cidx.groupby(["norm_title", "year"], as_index=False).apply(
+            best_core, include_groups=False
+        )
+        cidx["year"] = cidx["year"].astype(int)
+    return cidx
+
+
+# ---------- lookup that splits FORUM by '/' and applies the fallbacks ----------
 
 def lookup_scores(title_raw, year, jidx, cidx):
-    """Lookup IF/AIS/CORE rank for possibly multiple forum names separated by '/'."""
+    """Lookup IF/AIS/CORE for possibly multiple forum names separated by '/', with year fallback and 'best' picks."""
     if not title_raw:
         return "", "", ""
-
-    parts = [t.strip() for t in title_raw.split("/") if t.strip()]
-    if not parts:
-        return "", "", ""
+    parts = [t.strip() for t in str(title_raw).split("/") if t.strip()]
 
     scores_if, scores_ais, scores_core = [], [], []
     for part in parts:
         norm = normalize_title(part)
-        # journal match
-        jmatch = jidx[(jidx["norm_title"] == norm) & (jidx["year"] == year)]
-        if not jmatch.empty:
-            scores_if.append(to_text(jmatch["if"].iloc[0]))
-            scores_ais.append(to_text(jmatch["ais"].iloc[0]))
-        # core match
-        cmatch = cidx[(cidx["norm_title"] == norm) & (cidx["year"] == year)]
-        if not cmatch.empty:
-            scores_core.append(to_text(cmatch["core_rank"].iloc[0]))
+        j_if, j_ais = _lookup_journal_best(jidx, norm, year)
+        c_rank = _lookup_core_best(cidx, norm, year)
+        if j_if:  scores_if.append(j_if)
+        if j_ais: scores_ais.append(j_ais)
+        if c_rank: scores_core.append(c_rank)
 
-    return " / ".join([s for s in scores_if if s]), \
-           " / ".join([s for s in scores_ais if s]), \
-           " / ".join([s for s in scores_core if s])
+    return " / ".join(scores_if), " / ".join(scores_ais), " / ".join(scores_core)
 
 
 def attach_scores(formatted_df, journal_dir="out/journal", core_dir="out/core"):
