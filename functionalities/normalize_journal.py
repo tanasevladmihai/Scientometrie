@@ -240,7 +240,7 @@ def normalize_one_file(path, sheet_name=0):
     #         .str.replace(r"[^0-9Xx]", "", regex=True)
     #         .str.upper()
     #     )
-
+    #lol
     # Basic de-dup
     # subset = [c for c in ["journal_title", "issn_norm", "category"] if c in df.columns]
     # if subset:
@@ -286,11 +286,18 @@ def _norm_key(s: str) -> str:
     s = re.sub(r"\s+", "", s)   # remove ALL spaces
     return s
 
-def build_yearly_outputs(input_folder="journal_raw", output_dir="out/journal", log_file="log.csv", sheet_name=0):
+def build_yearly_outputs(input_folder="journal_raw", output_dir="out/journal", log_file="log.csv", sheet_name=0, file_list=None):
+    input_path = Path(input_folder)
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     buckets = {}  # year -> list[df]
 
-    for f in Path(input_folder).glob("*.xls*"):
+    files_to_process = []
+    if file_list:
+        files_to_process = [input_path / f for f in file_list]
+    else:
+        files_to_process = sorted(input_path.glob("*.xls*"))
+
+    for f in files_to_process:
         year = _infer_year_from_filename(f.name)
         if not year:
             print(f"[WARN] Skipping {f.name}: no year in filename")
@@ -303,7 +310,8 @@ def build_yearly_outputs(input_folder="journal_raw", output_dir="out/journal", l
             print(f"[WARN] {f.name}: {e}")
 
     if not buckets:
-        raise RuntimeError("No files parsed for any year.")
+        print("[WARN] No journal files parsed.")
+        return
 
     # open CSV log once
     with open(log_file, "w", newline="", encoding="utf-8") as csvfile:
@@ -349,5 +357,12 @@ def build_yearly_outputs(input_folder="journal_raw", output_dir="out/journal", l
             print(f"✅ Wrote {len(grouped):,} rows → {out_path}")
 
 if __name__ == "__main__":
-    # Adjust paths if needed
-    build_yearly_outputs(input_folder="journal_raw", output_dir="out/journal", sheet_name=0)
+    # To process all files:
+    # build_yearly_outputs(input_folder="journal_raw", output_dir="out/journal", sheet_name=0)
+
+    # To process specific files:
+    # file_list = ["some_journal_2021.xlsx", "another_journal_2020.xls"]
+    # build_yearly_outputs(input_folder="journal_raw", output_dir="out/journal", sheet_name=0, file_list=file_list)
+
+    # Default action:
+    build_yearly_outputs(input_folder="journal_raw", output_dir="../out/journal", sheet_name=0)

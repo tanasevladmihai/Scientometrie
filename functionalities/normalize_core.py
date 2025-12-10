@@ -105,14 +105,20 @@ def load_core_csv(path: Path) -> pd.DataFrame:
     return out[["year", "name", "acronym", "rank", "for_codes", "core_key_name", "core_key_acr"]]
 
 # ---------- batch: one normalized CSV per year ----------
-def build_core_yearly(input_folder="core_raw", output_dir="core_out"):
-    input_folder = Path(input_folder)
+def build_core_yearly(input_folder="core_raw", output_dir="out/core", file_list=None):
+    input_path = Path(input_folder)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    files_to_process = []
+    if file_list:
+        files_to_process = [input_path / f for f in file_list]
+    else:
+        files_to_process = sorted(input_path.glob("*.csv"))
+
     # bucket by year from filename
     buckets = {}
-    for f in sorted(input_folder.glob("*.csv")):
+    for f in files_to_process:
         try:
             df = load_core_csv(f)
             y = df["year"].iloc[0]
@@ -121,7 +127,8 @@ def build_core_yearly(input_folder="core_raw", output_dir="core_out"):
             print(f"[WARN] {f.name}: {e}")
 
     if not buckets:
-        raise RuntimeError("No CORE CSV files parsed.")
+        print("[WARN] No CORE CSV files parsed.")
+        return
 
     # write one CSV per year; de-dup within year by (name+acronym) key
     for year, frames in buckets.items():
@@ -137,5 +144,12 @@ def build_core_yearly(input_folder="core_raw", output_dir="core_out"):
         print(f"✅ Wrote {len(out):,} rows → {out_path}")
 
 if __name__ == "__main__":
-    # change folders as needed
-    build_core_yearly(input_folder="core_raw", output_dir="out/core")
+    # To process all files in 'core_raw':
+    # build_core_yearly(input_folder="core_raw", output_dir="out/core")
+
+    # To process specific files:
+    # file_list = ["CORE2021.csv", "CORE2020.csv"]
+    # build_core_yearly(input_folder="core_raw", output_dir="out/core", file_list=file_list)
+    
+    # Default action:
+    build_core_yearly(input_folder="core_raw", output_dir="../out/core")

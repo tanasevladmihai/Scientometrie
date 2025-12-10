@@ -21,7 +21,8 @@ Output columns:
 - Categorie AIS
 
 Usage:
-    python combine_biblio.py --input exports --output out
+    python reformat.py --input exports --output out
+    !! In Scientometrie v2 this is not needed anymore, as we have an interactive GUI now. I will leave the comments as they were left by Tudor
 
 Requires:
     pip install pandas openpyxl xlrd
@@ -474,20 +475,15 @@ def format_final(df: pd.DataFrame) -> pd.DataFrame:
 
 # ---------- Main ----------
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", "-i", required=True, help="Input folder with paired Scopus/WoS files")
-    ap.add_argument("--output", "-o", required=True, help="Output folder for merged Excel files")
-    args = ap.parse_args()
-
-    os.makedirs(args.output, exist_ok=True)
+def main(input_dir, output_dir, file_list=None, journal_dir="out/journal", core_dir="out/core"):
+    os.makedirs(output_dir, exist_ok=True)
 
     # group files by basename
-    files = os.listdir(args.input)
+    files_to_process = file_list if file_list else os.listdir(input_dir)
     basenames = {}
-    for f in files:
+    for f in files_to_process:
         base, ext = os.path.splitext(f)
-        basenames.setdefault(base, []).append(os.path.join(args.input, f))
+        basenames.setdefault(base, []).append(os.path.join(input_dir, f))
 
     for base, paths in basenames.items():
         scopus_path = next((p for p in paths if p.lower().endswith(".csv")), None)
@@ -510,12 +506,22 @@ def main():
 
         # format + attach scores (IF/AIS/CORE) as usual
         formatted = format_final(raw)
-        formatted = attach_scores(formatted, journal_dir="out/journal", core_dir="out/core")
+        formatted = attach_scores(formatted, journal_dir=journal_dir, core_dir=core_dir)
 
-        out_path = os.path.join(args.output, f"{base}{suffix}.xlsx")
+        out_path = os.path.join(output_dir, f"{base}{suffix}.xlsx")
         formatted.to_excel(out_path, index=False)
         print(f"Saved -> {out_path}")
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", "-i", default="exports", help="Input folder with paired Scopus/WoS files")
+    ap.add_argument("--output", "-o", default="out", help="Output folder for merged Excel files")
+    ap.add_argument("--journal_dir", default="out/journal", help="Directory with normalized journal score files")
+    ap.add_argument("--core_dir", default="out/core", help="Directory with normalized CORE score files")
+    ap.add_argument('files', nargs='*', help="Specific files to process (optional)")
+    args = ap.parse_args()
+
+    file_list = args.files if args.files else None
+    
+    main(args.input, args.output, file_list=file_list, journal_dir=args.journal_dir, core_dir=args.core_dir)
