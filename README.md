@@ -35,5 +35,3 @@ These files should contain tables populated by scientific journals and related i
 Tkinter does not require an installation as it is already present in every modern Python version installed.
 
 ***Note:** If you're using Jetbrains Pycharm IDE you can simply go into the Python Packages tab, search for the packages and download & install them from there.*
-
-<img width="644" height="950" alt="image" src="https://github.com/user-attachments/assets/a1fc0a07-0c7f-457d-9017-c29ccbaca7e5" />
