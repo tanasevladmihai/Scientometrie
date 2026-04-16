@@ -1,11 +1,12 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import sys
+import logging
 from pathlib import Path
-import subprocess
 from threading import Thread
 import queue
 
+# Ensure project root is in sys.path
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
@@ -13,329 +14,301 @@ from functionalities.normalize_core import build_core_yearly
 from functionalities.normalize_journal import build_yearly_outputs
 from functionalities.reformat import main as reformat_main
 
-class ProcessRunner:
-    def __init__(self, target, args, kwargs):
+# ---------- Logging Utilities ----------
+
+class QueueHandler(logging.Handler):
+    """Sends log records to a queue for the GUI to consume."""
+    def __init__(self, log_queue):
+        super().__init__()
+        self.log_queue = log_queue
+
+    def emit(self, record):
+        self.log_queue.put(self.format(record) + "\n")
+
+# ---------- Execution Engine ----------
+
+class WorkerThread(Thread):
+    def __init__(self, target, kwargs, on_complete, on_error):
+        super().__init__(daemon=True)
         self.target = target
-        self.args = args
         self.kwargs = kwargs
-        self.process = None
-        self.log_queue = queue.Queue()
-        self.thread = None
+        self.on_complete = on_complete
+        self.on_error = on_error
 
-    def start(self):
-        self.thread = Thread(target=self._run)
-        self.thread.start()
-
-    def _run(self):
+    def run(self):
         try:
-            #this thing redirects stdout and stderr
-            p = subprocess.Popen(
-                [sys.executable, "-c", f"from {self.target.__module__} import {self.target.__name__}; {self.target.__name__}(*{self.args}, **{self.kwargs})"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding='utf-8',
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            self.process = p
-            for line in iter(p.stdout.readline, ''):
-                self.log_queue.put(line)
-            p.stdout.close()
-            p.wait()
+            self.target(**self.kwargs)
+            self.on_complete()
         except Exception as e:
-            self.log_queue.put(f"Error running process: {e}\n")
-        finally:
-            self.log_queue.put(None) # Signal end of logs
+            self.on_error(e)
 
-    def is_running(self):
-        return self.thread and self.thread.is_alive()
+# ---------- GUI Application ----------
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Scientometrie GUI")
-        self.geometry("800x600")
+        self.title("Scientometrie v2 - Refactored")
+        self.geometry("850x700")
+        
+        self.log_queue = queue.Queue()
+        self._setup_logging()
+        self._create_widgets()
+        self._set_initial_state()
+        self._poll_log_queue()
 
+    def _setup_logging(self):
+        # Root logger setup
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.INFO)
+        
+        # Handler for the GUI console
+        handler = QueueHandler(self.log_queue)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        root_logger.addHandler(handler)
+
+    def _create_widgets(self):
         main_frame = ttk.Frame(self)
         main_frame.pack(fill=tk.BOTH, expand=1)
 
         canvas = tk.Canvas(main_frame)
         scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
+        self.scrollable_frame = ttk.Frame(canvas)
 
-        scrollable_frame.bind(
+        self.scrollable_frame.bind(
             "<Configure>",
-            lambda e: canvas.configure(
-                scrollregion=canvas.bbox("all")
-            )
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
 
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
-
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        self.core_frame = self.create_section(scrollable_frame, "1. Normalize Core Files")
-        self.core_input_var = self.create_folder_selection(self.core_frame, "Input Folder:", "core_raw")
-        self.core_output_var = self.create_folder_selection(self.core_frame, "Output Folder:", "out/core")
-        self.core_mode = self.create_radio_buttons(self.core_frame, {
-            "Normalize all files": "all",
-            "Select specific files": "select",
-            "Skip normalization": "skip"
-        }, self.toggle_core_files)
-        self.core_file_listbox = self.create_file_listbox(self.core_frame)
-        self.core_console = self.create_console(self.core_frame)
-        self.core_button = ttk.Button(self.core_frame, text="Confirm and Proceed", command=self.run_core_normalization)
-        self.core_button.pack(pady=5)
+        # Section 1: CORE
+        self.core_frame = self._create_section("1. Normalize Core Files")
+        self.core_input = self._create_path_selector(self.core_frame, "Input:", "core_raw")
+        self.core_output = self._create_path_selector(self.core_frame, "Output:", "out/core")
+        self.core_mode = self._create_mode_selector(self.core_frame, self._toggle_core_list)
+        self.core_list = self._create_file_list(self.core_frame)
+        self.core_console = self._create_console(self.core_frame)
+        self.core_btn = ttk.Button(self.core_frame, text="Process CORE", command=self._run_core)
+        self.core_btn.pack(pady=5)
 
-        self.journal_frame = self.create_section(scrollable_frame, "2. Normalize Journal Files")
-        self.journal_input_var = self.create_folder_selection(self.journal_frame, "Input Folder:", "journal_raw")
-        self.journal_output_var = self.create_folder_selection(self.journal_frame, "Output Folder:", "out/journal")
-        self.journal_mode = self.create_radio_buttons(self.journal_frame, {
-            "Process all files": "all",
-            "Select specific files": "select",
-            "Skip normalization": "skip"
-        }, self.toggle_journal_files)
-        self.journal_file_listbox = self.create_file_listbox(self.journal_frame)
-        self.journal_console = self.create_console(self.journal_frame)
-        self.journal_button = ttk.Button(self.journal_frame, text="Confirm and Proceed", command=self.run_journal_normalization)
-        self.journal_button.pack(pady=5)
+        # Section 2: Journal
+        self.journal_frame = self._create_section("2. Normalize Journal Files")
+        self.journal_input = self._create_path_selector(self.journal_frame, "Input:", "journal_raw")
+        self.journal_output = self._create_path_selector(self.journal_frame, "Output:", "out/journal")
+        self.journal_mode = self._create_mode_selector(self.journal_frame, self._toggle_journal_list)
+        self.journal_list = self._create_file_list(self.journal_frame)
+        self.journal_console = self._create_console(self.journal_frame)
+        self.journal_btn = ttk.Button(self.journal_frame, text="Process Journals", command=self._run_journal)
+        self.journal_btn.pack(pady=5)
 
-        self.reformat_frame = self.create_section(scrollable_frame, "3. Reformat Files")
-        self.reformat_input_var = self.create_folder_selection(self.reformat_frame, "Input Folder:", "exports")
-        self.reformat_output_var = self.create_folder_selection(self.reformat_frame, "Output Folder:", "out")
-        self.reformat_mode = self.create_radio_buttons(self.reformat_frame, {
-            "Process all files": "all",
-            "Select specific files": "select",
-            "Skip processing": "skip"
-        }, self.toggle_reformat_files)
-        self.reformat_file_listbox = self.create_file_listbox(self.reformat_frame)
-        self.reformat_console = self.create_console(self.reformat_frame)
-        self.reformat_button = ttk.Button(self.reformat_frame, text="Run Reformatting", command=self.run_reformatting)
-        self.reformat_button.pack(pady=5)
+        # Section 3: Reformat
+        self.reformat_frame = self._create_section("3. Final Reformatting")
+        self.reformat_input = self._create_path_selector(self.reformat_frame, "Input:", "exports")
+        self.reformat_output = self._create_path_selector(self.reformat_frame, "Output:", "out")
+        self.reformat_mode = self._create_mode_selector(self.reformat_frame, self._toggle_reformat_list)
+        self.reformat_list = self._create_file_list(self.reformat_frame)
+        self.reformat_console = self._create_console(self.reformat_frame)
+        self.reformat_btn = ttk.Button(self.reformat_frame, text="Run Final Reformat", command=self._run_reformat)
+        self.reformat_btn.pack(pady=5)
 
-        self.set_initial_state()
+    # --- Widget Helpers ---
 
-    def create_section(self, parent, text):
-        frame = ttk.LabelFrame(parent, text=text, padding="10")
-        frame.pack(fill=tk.X, padx=10, pady=5)
-        return frame
+    def _create_section(self, title):
+        f = ttk.LabelFrame(self.scrollable_frame, text=title, padding=10)
+        f.pack(fill=tk.X, padx=10, pady=5)
+        return f
 
-    def create_folder_selection(self, parent, label_text, default_folder):
-        frame = ttk.Frame(parent)
-        frame.pack(fill=tk.X, pady=2)
-        label = ttk.Label(frame, text=label_text, width=15)
-        label.pack(side=tk.LEFT)
-        
-        folder_var = tk.StringVar(value=str(project_root / default_folder))
-        entry = ttk.Entry(frame, textvariable=folder_var)
-        entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        
-        button = ttk.Button(frame, text="Browse...", command=lambda: self.browse_folder(folder_var))
-        button.pack(side=tk.LEFT, padx=5)
-        return folder_var
-
-    def create_radio_buttons(self, parent, options, command):
-        var = tk.StringVar(value=list(options.values())[0])
-        frame = ttk.Frame(parent)
-        frame.pack(fill=tk.X, pady=2)
-        for text, value in options.items():
-            rb = ttk.Radiobutton(frame, text=text, variable=var, value=value, command=command)
-            rb.pack(side=tk.LEFT, padx=5)
+    def _create_path_selector(self, parent, label, default):
+        f = ttk.Frame(parent)
+        f.pack(fill=tk.X, pady=2)
+        ttk.Label(f, text=label, width=10).pack(side=tk.LEFT)
+        var = tk.StringVar(value=str(project_root / default))
+        ttk.Entry(f, textvariable=var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(f, text="...", width=3, command=lambda: self._browse(var)).pack(side=tk.LEFT, padx=2)
         return var
 
-    def create_file_listbox(self, parent):
-        frame = ttk.Frame(parent)
-        listbox = tk.Listbox(frame, selectmode=tk.MULTIPLE, height=5)
-        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=listbox.yview)
-        listbox.configure(yscrollcommand=scrollbar.set)
-        
-        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        return {"frame": frame, "listbox": listbox}
+    def _create_mode_selector(self, parent, command):
+        v = tk.StringVar(value="all")
+        f = ttk.Frame(parent)
+        f.pack(fill=tk.X, pady=2)
+        for text, val in [("All", "all"), ("Select", "select"), ("Skip", "skip")]:
+            ttk.Radiobutton(f, text=text, variable=v, value=val, command=command).pack(side=tk.LEFT, padx=10)
+        return v
 
-    def create_console(self, parent):
-        frame = ttk.Frame(parent, height=100)
-        frame.pack(fill=tk.X, pady=5)
-        console = tk.Text(frame, height=6, state='disabled', bg='black', fg='white', font=("Courier", 9))
-        scrollbar = ttk.Scrollbar(frame, command=console.yview)
-        console.config(yscrollcommand=scrollbar.set)
-        
-        console.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        return console
+    def _create_file_list(self, parent):
+        f = ttk.Frame(parent)
+        lb = tk.Listbox(f, selectmode=tk.MULTIPLE, height=4)
+        sb = ttk.Scrollbar(f, command=lb.yview)
+        lb.config(yscrollcommand=sb.set)
+        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        return {"frame": f, "list": lb}
 
-    def browse_folder(self, var):
-        folder = filedialog.askdirectory(initialdir=project_root)
-        if folder:
-            var.set(folder)
+    def _create_console(self, parent):
+        t = tk.Text(parent, height=5, state='disabled', bg='#1e1e1e', fg='#d4d4d4', font=("Consolas", 9))
+        t.pack(fill=tk.X, pady=5)
+        return t
 
-    def set_initial_state(self):
-        self.toggle_core_files()
-        self.toggle_journal_files()
-        self.toggle_reformat_files()
-        self.set_frame_state(self.journal_frame, 'disabled')
-        self.set_frame_state(self.reformat_frame, 'disabled')
+    def _browse(self, var):
+        d = filedialog.askdirectory(initialdir=var.get())
+        if d: var.set(d)
 
-    def set_frame_state(self, frame, state):
+    # --- State Management ---
+
+    def _set_initial_state(self):
+        self._toggle_core_list()
+        self._toggle_journal_list()
+        self._toggle_reformat_list()
+        self._set_frame_enabled(self.journal_frame, False)
+        self._set_frame_enabled(self.reformat_frame, False)
+
+    def _set_frame_enabled(self, frame, enabled):
+        state = "normal" if enabled else "disabled"
         for child in frame.winfo_children():
             try:
                 child.configure(state=state)
             except tk.TclError:
-                self.set_frame_state(child, state)
+                self._set_frame_enabled(child, enabled)
 
-    def toggle_core_files(self):
+    def _toggle_core_list(self):
         if self.core_mode.get() == "select":
-            self.core_file_listbox["frame"].pack(fill=tk.X, padx=10, pady=5)
-            self.populate_file_list(self.core_input_var, self.core_file_listbox["listbox"], "*.csv")
+            self.core_list["frame"].pack(fill=tk.X, pady=5)
+            self._fill_list(self.core_input, self.core_list["list"], "*.csv")
         else:
-            self.core_file_listbox["frame"].pack_forget()
+            self.core_list["frame"].pack_forget()
 
-    def toggle_journal_files(self):
+    def _toggle_journal_list(self):
         if self.journal_mode.get() == "select":
-            self.journal_file_listbox["frame"].pack(fill=tk.X, padx=10, pady=5)
-            self.populate_file_list(self.journal_input_var, self.journal_file_listbox["listbox"], "*.xls*")
+            self.journal_list["frame"].pack(fill=tk.X, pady=5)
+            self._fill_list(self.journal_input, self.journal_list["list"], "*.xls*")
         else:
-            self.journal_file_listbox["frame"].pack_forget()
+            self.journal_list["frame"].pack_forget()
 
-    def toggle_reformat_files(self):
+    def _toggle_reformat_list(self):
         if self.reformat_mode.get() == "select":
-            self.reformat_file_listbox["frame"].pack(fill=tk.X, padx=10, pady=5)
-            self.populate_file_list(self.reformat_input_var, self.reformat_file_listbox["listbox"], ("*.csv", "*.xls*"))
+            self.reformat_list["frame"].pack(fill=tk.X, pady=5)
+            self._fill_list(self.reformat_input, self.reformat_list["list"], ("*.csv", "*.xls*"))
         else:
-            self.reformat_file_listbox["frame"].pack_forget()
+            self.reformat_list["frame"].pack_forget()
 
-    def populate_file_list(self, folder_var, listbox, patterns):
-        listbox.delete(0, tk.END)
-        folder = Path(folder_var.get())
-        if not folder.is_dir():
-            return
-        if isinstance(patterns, str):
-            patterns = [patterns]
-        
+    def _fill_list(self, var, lb, patterns):
+        lb.delete(0, tk.END)
+        p = Path(var.get())
+        if not p.is_dir(): return
+        if isinstance(patterns, str): patterns = [patterns]
         files = []
-        for pattern in patterns:
-            files.extend(folder.glob(pattern))
-            
-        for f in sorted(files):
-            listbox.insert(tk.END, f.name)
+        for pat in patterns: files.extend(p.glob(pat))
+        for f in sorted(files): lb.insert(tk.END, f.name)
 
-    def run_core_normalization(self):
-        mode = self.core_mode.get()
-        if mode == "skip":
-            self.log_to_console(self.core_console, "Core normalization skipped.\n")
-            self.set_frame_state(self.core_frame, 'disabled')
-            self.set_frame_state(self.journal_frame, 'normal')
-            return
+    # --- Execution Logic ---
 
-        input_folder = self.core_input_var.get()
-        output_folder = self.core_output_var.get()
-        file_list = None
-
-        if mode == "select":
-            selected_indices = self.core_file_listbox["listbox"].curselection()
-            if not selected_indices:
-                messagebox.showerror("Error", "Please select files to normalize.")
-                return
-            file_list = [self.core_file_listbox["listbox"].get(i) for i in selected_indices]
-
-        self.core_button.config(state='disabled')
-        runner = ProcessRunner(
-            target=build_core_yearly,
-            args=(),
-            kwargs={'input_folder': input_folder, 'output_dir': output_folder, 'file_list': file_list}
-        )
-        runner.start()
-        self.monitor_process(runner, self.core_console, lambda: [
-            self.set_frame_state(self.core_frame, 'disabled'),
-            self.set_frame_state(self.journal_frame, 'normal')
-        ])
-
-    def run_journal_normalization(self):
-        mode = self.journal_mode.get()
-        if mode == "skip":
-            self.log_to_console(self.journal_console, "Journal normalization skipped.\n")
-            self.set_frame_state(self.journal_frame, 'disabled')
-            self.set_frame_state(self.reformat_frame, 'normal')
-            return
-
-        input_folder = self.journal_input_var.get()
-        output_folder = self.journal_output_var.get()
-        file_list = None
-
-        if mode == "select":
-            selected_indices = self.journal_file_listbox["listbox"].curselection()
-            if not selected_indices:
-                messagebox.showerror("Error", "Please select files to process.")
-                return
-            #file_list = [self.journal_file_listbox["listbox"].get(i) for i in selected_.get(i) for i in selected_indices]
-            file_list = [self.journal_file_listbox["listbox"].get(i) for i in selected_indices]
-        self.journal_button.config(state='disabled')
-        runner = ProcessRunner(
-            target=build_yearly_outputs,
-            args=(),
-            kwargs={'input_folder': input_folder, 'output_dir': output_folder, 'file_list': file_list}
-        )
-        runner.start()
-        self.monitor_process(runner, self.journal_console, lambda: [
-            self.set_frame_state(self.journal_frame, 'disabled'),
-            self.set_frame_state(self.reformat_frame, 'normal')
-        ])
-
-    def run_reformatting(self):
-        mode = self.reformat_mode.get()
-        if mode == "skip":
-            self.log_to_console(self.reformat_console, "Reformatting skipped. Program finished.\n")
-            self.reformat_button.config(state='disabled')
-            return
-
-        input_dir = self.reformat_input_var.get()
-        output_dir = self.reformat_output_var.get()
-        journal_dir = self.journal_output_var.get()
-        core_dir = self.core_output_var.get()
-        file_list = None
-
-        if mode == "select":
-            selected_indices = self.reformat_file_listbox["listbox"].curselection()
-            if not selected_indices:
-                messagebox.showerror("Error", "Please select files for reformatting.")
-                return
-            file_list = [self.reformat_file_listbox["listbox"].get(i) for i in selected_indices]
-
-        self.reformat_button.config(state='disabled')
-        runner = ProcessRunner(
-            target=reformat_main,
-            args=(),
-            kwargs={
-                'input_dir': input_dir,
-                'output_dir': output_dir,
-                'file_list': file_list,
-                'journal_dir': journal_dir,
-                'core_dir': core_dir
-            }
-        )
-        runner.start()
-        self.monitor_process(runner, self.reformat_console, lambda: self.log_to_console(self.reformat_console, "All processes finished.\n"))
-
-    def log_to_console(self, console, message):
-        console.config(state='normal')
-        console.insert(tk.END, message)
-        console.see(tk.END)
-        console.config(state='disabled')
-
-    def monitor_process(self, runner, console, on_complete):
+    def _poll_log_queue(self):
         try:
             while True:
-                line = runner.log_queue.get_nowait()
-                if line is None:
-                    self.log_to_console(console, "\nProcess finished.\n")
-                    on_complete()
-                    break
-                self.log_to_console(console, line)
+                msg = self.log_queue.get_nowait()
+                # Append to ALL consoles for simplicity, or we could track active console
+                for c in [self.core_console, self.journal_console, self.reformat_console]:
+                    c.config(state='normal')
+                    c.insert(tk.END, msg)
+                    c.see(tk.END)
+                    c.config(state='disabled')
         except queue.Empty:
-            self.after(100, lambda: self.monitor_process(runner, console, on_complete))
+            pass
+        self.after(100, self._poll_log_queue)
+
+    def _preflight_check(self, path_var):
+        p = Path(path_var.get())
+        if not p.exists():
+            messagebox.showerror("Error", f"Path does not exist: {p}")
+            return False
+        return True
+
+    def _run_core(self):
+        mode = self.core_mode.get()
+        if mode == "skip":
+            self._on_core_complete()
+            return
+        if not self._preflight_check(self.core_input): return
+        
+        files = None
+        if mode == "select":
+            sel = self.core_list["list"].curselection()
+            if not sel: return messagebox.showwarning("Warning", "No files selected")
+            files = [self.core_list["list"].get(i) for i in sel]
+
+        self.core_btn.config(state='disabled')
+        WorkerThread(
+            target=build_core_yearly,
+            kwargs={'input_folder': self.core_input.get(), 'output_dir': self.core_output.get(), 'file_list': files},
+            on_complete=self._on_core_complete,
+            on_error=self._on_error
+        ).start()
+
+    def _on_core_complete(self):
+        self.after(0, lambda: [
+            self._set_frame_enabled(self.core_frame, False),
+            self._set_frame_enabled(self.journal_frame, True)
+        ])
+
+    def _run_journal(self):
+        mode = self.journal_mode.get()
+        if mode == "skip":
+            self._on_journal_complete()
+            return
+        if not self._preflight_check(self.journal_input): return
+        
+        files = None
+        if mode == "select":
+            sel = self.journal_list["list"].curselection()
+            if not sel: return messagebox.showwarning("Warning", "No files selected")
+            files = [self.journal_list["list"].get(i) for i in sel]
+
+        self.journal_btn.config(state='disabled')
+        WorkerThread(
+            target=build_yearly_outputs,
+            kwargs={'input_folder': self.journal_input.get(), 'output_dir': self.journal_output.get(), 'file_list': files},
+            on_complete=self._on_journal_complete,
+            on_error=self._on_error
+        ).start()
+
+    def _on_journal_complete(self):
+        self.after(0, lambda: [
+            self._set_frame_enabled(self.journal_frame, False),
+            self._set_frame_enabled(self.reformat_frame, True)
+        ])
+
+    def _run_reformat(self):
+        mode = self.reformat_mode.get()
+        if mode == "skip":
+            messagebox.showinfo("Done", "Processing complete.")
+            return
+        if not self._preflight_check(self.reformat_input): return
+        
+        files = None
+        if mode == "select":
+            sel = self.reformat_list["list"].curselection()
+            if not sel: return messagebox.showwarning("Warning", "No files selected")
+            files = [self.reformat_list["list"].get(i) for i in sel]
+
+        self.reformat_btn.config(state='disabled')
+        WorkerThread(
+            target=reformat_main,
+            kwargs={
+                'input_dir': self.reformat_input.get(),
+                'output_dir': self.reformat_output.get(),
+                'file_list': files,
+                'journal_dir': self.journal_output.get(),
+                'core_dir': self.core_output.get()
+            },
+            on_complete=lambda: messagebox.showinfo("Done", "Final reformatting complete."),
+            on_error=self._on_error
+        ).start()
+
+    def _on_error(self, e):
+        self.after(0, lambda: messagebox.showerror("Process Error", str(e)))
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    App().mainloop()
